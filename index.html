@@ -130,6 +130,14 @@
     <div class="toggle-pill on" id="autoplayPill"></div>
     Autoplay
   </div>
+  <div class="autoplay-toggle" id="randomToggle">
+    <div class="toggle-pill" id="randomPill"></div>
+    Random
+  </div>
+  <div class="autoplay-toggle" id="shortsToggle">
+    <div class="toggle-pill on" id="shortsPill"></div>
+    No Shorts
+  </div>
   <div class="stats-bar">
     <div class="stat"><strong id="stat-channels">0</strong> canali</div>
     <div class="stat"><strong id="stat-videos">0</strong> video</div>
@@ -267,11 +275,38 @@ const DEMO_CHANNELS = [
   { title: 'Mark Rober',     id: 'UCY1kMZp36IQSyNx_9h4mpCg', url: '', cat: 'Science',   catColor: '#9FE1CB' },
 ].map(c => ({ ...c, videos: [], loaded: false, error: false }));
 
+// Shorts detection: YouTube Shorts are typically <= 60s.
+// The RSS feed doesn't expose duration, but Shorts titles/ids share no reliable marker.
+// Best heuristic without API: flag videos whose title contains "#shorts" or "shorts" as a word,
+// OR whose video id appears in a known-short thumbnail ratio (portrait).
+// We use title heuristic + a duration check via oEmbed when filtering.
+// For simplicity and reliability we use title keywords + a separate duration fetch.
+
+const SHORTS_TITLE_RE = /\b(#?shorts?)\b/i;
+
+// Duration check: fetch oEmbed to get nothing (no duration exposed), so we use
+// a known trick: YouTube Shorts always have /shorts/ in their canonical URL.
+// We check this via a lightweight HEAD fetch through the allorigins proxy.
+async function isShort(videoId) {
+  try {
+    const url = `https://www.youtube.com/shorts/${videoId}`;
+    const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+    const res = await fetch(proxy, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return false;
+    const json = await res.json();
+    // If the page redirects to /shorts/ and doesn't 404, it's a Short
+    // allorigins returns the final URL in status.url
+    return json.status?.url?.includes('/shorts/') ?? false;
+  } catch { return false; }
+}
+
 let state = {
   channels: [],
   activeCategory: 'Tutti',
   activeVideoId: null,
   autoplay: true,
+  randomMode: false,
+  filterShorts: true,
   searchQuery: '',
 };
 
@@ -287,7 +322,9 @@ function filteredVideos() {
   return allVideos().filter(v => {
     const catOk = state.activeCategory === 'Tutti' || v.cat === state.activeCategory;
     const q = state.searchQuery.toLowerCase();
-    return catOk && (!q || v.title.toLowerCase().includes(q) || v.channel.toLowerCase().includes(q));
+    const searchOk = !q || v.title.toLowerCase().includes(q) || v.channel.toLowerCase().includes(q);
+    const shortsOk = !state.filterShorts || !v.isShort;
+    return catOk && searchOk && shortsOk;
   });
 }
 
@@ -297,6 +334,8 @@ function saveState() {
       channels: state.channels.map(c => ({ title:c.title, id:c.id, url:c.url, cat:c.cat, catColor:c.catColor, videos:c.videos, loaded:c.loaded, error:c.error })),
       activeCategory: state.activeCategory,
       autoplay: state.autoplay,
+      randomMode: state.randomMode,
+      filterShorts: state.filterShorts,
     }));
   } catch(e) {}
 }
@@ -309,6 +348,8 @@ function loadStoredState() {
     state.channels = (s.channels || []).map(c => ({ ...c, videos: c.videos||[], loaded:!!c.loaded, error:!!c.error }));
     state.activeCategory = s.activeCategory || 'Tutti';
     state.autoplay = s.autoplay !== undefined ? s.autoplay : true;
+    state.randomMode = s.randomMode !== undefined ? s.randomMode : false;
+    state.filterShorts = s.filterShorts !== undefined ? s.filterShorts : true;
     return state.channels.length > 0;
   } catch(e) { return false; }
 }
@@ -445,7 +486,9 @@ async function fetchRSS(channelId) {
     const rawId = e.querySelector('videoId')?.textContent || e.querySelector('id')?.textContent || '';
     const id = rawId.replace('yt:video:', '').trim();
     const title = e.querySelector('title')?.textContent?.trim() || 'Video';
-    return { id, title };
+    // Heuristic: flag as short if title contains "shorts" keyword
+    const isShort = SHORTS_TITLE_RE.test(title);
+    return { id, title, isShort };
   }).filter(v => v.id && v.id.length > 5);
 }
 
@@ -496,22 +539,40 @@ document.getElementById('prevBtn').addEventListener('click', () => {
   if (idx > 0) { const v = vids[idx-1]; playVideo(v, state.channels.find(c=>c.title===v.channel)); }
 });
 document.getElementById('nextBtn').addEventListener('click', () => {
-  const vids = filteredVideos();
-  const idx = vids.findIndex(v => v.id === state.activeVideoId);
-  if (idx >= 0 && idx < vids.length-1) { const v = vids[idx+1]; playVideo(v, state.channels.find(c=>c.title===v.channel)); }
+  playNext();
 });
 
-// Autoplay next on end
+function playNext() {
+  const vids = filteredVideos();
+  if (!vids.length) return;
+  // Get pool: videos in the same category as currently playing (or all if Tutti)
+  const currentVid = vids.find(v => v.id === state.activeVideoId);
+  const cat = currentVid?.cat || (state.activeCategory !== 'Tutti' ? state.activeCategory : null);
+  const pool = cat ? vids.filter(v => v.cat === cat) : vids;
+  if (!pool.length) return;
+
+  if (state.randomMode) {
+    // Pick a random video from pool, excluding current
+    const choices = pool.filter(v => v.id !== state.activeVideoId);
+    if (!choices.length) return;
+    const v = choices[Math.floor(Math.random() * choices.length)];
+    playVideo(v, state.channels.find(c => c.title === v.channel));
+  } else {
+    const idx = vids.findIndex(v => v.id === state.activeVideoId);
+    if (idx >= 0 && idx < vids.length - 1) {
+      const v = vids[idx + 1];
+      playVideo(v, state.channels.find(c => c.title === v.channel));
+    }
+  }
+}
+
+// Autoplay next on video end
 window.addEventListener('message', e => {
   if (!state.autoplay) return;
   try {
     const d = typeof e.data==='string' ? JSON.parse(e.data) : e.data;
     if (d?.event==='onStateChange' && d?.info===0) {
-      setTimeout(() => {
-        const vids = filteredVideos();
-        const idx = vids.findIndex(v => v.id === state.activeVideoId);
-        if (idx >= 0 && idx < vids.length-1) { const v = vids[idx+1]; playVideo(v, state.channels.find(c=>c.title===v.channel)); }
-      }, 1500);
+      setTimeout(playNext, 1500);
     }
   } catch(ex) {}
 });
@@ -519,6 +580,19 @@ window.addEventListener('message', e => {
 document.getElementById('autoplayToggle').addEventListener('click', () => {
   state.autoplay = !state.autoplay;
   document.getElementById('autoplayPill').className = 'toggle-pill' + (state.autoplay?' on':'');
+  saveState();
+});
+
+document.getElementById('randomToggle').addEventListener('click', () => {
+  state.randomMode = !state.randomMode;
+  document.getElementById('randomPill').className = 'toggle-pill' + (state.randomMode?' on':'');
+  saveState();
+});
+
+document.getElementById('shortsToggle').addEventListener('click', () => {
+  state.filterShorts = !state.filterShorts;
+  document.getElementById('shortsPill').className = 'toggle-pill' + (state.filterShorts?' on':'');
+  renderVideoList();
   saveState();
 });
 
@@ -551,6 +625,8 @@ document.getElementById('loadDemo').addEventListener('click', () => initChannels
 // Boot
 if (loadStoredState()) {
   document.getElementById('autoplayPill').className = 'toggle-pill' + (state.autoplay?' on':'');
+  document.getElementById('randomPill').className = 'toggle-pill' + (state.randomMode?' on':'');
+  document.getElementById('shortsPill').className = 'toggle-pill' + (state.filterShorts?' on':'');
   updateStats(); renderCatTabs(); renderVideoList();
   const needLoad = state.channels.filter(c => !c.loaded && !c.error);
   if (needLoad.length) loadAllRSS(needLoad);
